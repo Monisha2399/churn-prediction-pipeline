@@ -1,0 +1,3 @@
+# Sample data files land here after running scripts/generate_data.py
+# These small files (10-50 rows each) are committed to the repo for reference.
+# Full dataset is gitignored and lives in S3.
