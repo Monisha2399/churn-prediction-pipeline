@@ -1,0 +1,159 @@
+# Customer Churn Prediction — all services on one EC2 instance (m7i-flex.large, 8 GB recommended)
+x-common-env: &common-env
+  POSTGRES_HOST:       postgres
+  POSTGRES_PORT:       "5432"
+  POSTGRES_DB:         ${POSTGRES_DB:-churndb}
+  POSTGRES_USER:       ${POSTGRES_USER:-churnuser}
+  POSTGRES_PASSWORD:   ${POSTGRES_PASSWORD}
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  S3_BUCKET:           ${S3_BUCKET}
+  AWS_DEFAULT_REGION:  ${AWS_DEFAULT_REGION:-ap-south-1}
+  RANDOM_SEED:         ${RANDOM_SEED:-42}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: churn-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-churndb}
+      POSTGRES_USER:     ${POSTGRES_USER:-churnuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init/00-airflowdb.sql:/docker-entrypoint-initdb.d/00-airflowdb.sql:ro
+      - ./src/ingestion/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"          # local only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-churnuser} -d ${POSTGRES_DB:-churndb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    build: {context: ., dockerfile: Dockerfile.mlflow}
+    container_name: churn-mlflow
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-south-1}
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - postgresql+psycopg2://${POSTGRES_USER:-churnuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-churndb}
+      - --default-artifact-root
+      - s3://${S3_BUCKET}/mlflow-artifacts
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: {context: ., dockerfile: Dockerfile}
+    container_name: churn-api
+    restart: unless-stopped
+    depends_on:
+      mlflow: {condition: service_healthy}
+    environment:
+      <<: *common-env
+      CHAMPION_MODEL_NAME: ${CHAMPION_MODEL_NAME:-churn_classifier}
+      MODEL_NAME:          ${MODEL_NAME:-champion}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  airflow:
+    build: {context: ., dockerfile: Dockerfile.airflow}
+    container_name: churn-airflow
+    restart: unless-stopped
+    user: "${AIRFLOW_UID:-1000}:0"
+    depends_on:
+      postgres: {condition: service_healthy}
+      mlflow:   {condition: service_healthy}
+    environment:
+      <<: *common-env
+      PYTHONPATH:    /opt/airflow
+      ARTIFACT_DIR:  /opt/airflow/artifacts
+      DATA_SNAPSHOT: ${DATA_SNAPSHOT:-2026-11-01}
+      CHAMPION_MODEL_NAME: ${CHAMPION_MODEL_NAME:-churn_classifier}
+      MODEL_NAME:          ${MODEL_NAME:-champion}
+      AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-churnuser}:${POSTGRES_PASSWORD}@postgres:5432/airflowdb
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__WORKERS: "2"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - ./artifacts:/opt/airflow/artifacts
+      - ./airflow_logs:/opt/airflow/logs
+    command: >
+      bash -c "airflow db migrate &&
+      airflow users create --username $${AIRFLOW_ADMIN_USERNAME} --password $${AIRFLOW_ADMIN_PASSWORD}
+      --firstname Admin --lastname User --role Admin --email admin@example.com || true;
+      airflow scheduler & exec airflow webserver"
+    ports:
+      - "8080:8080"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: churn-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:9090:9090"          # local only; Grafana reaches it on the Docker network
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: churn-grafana
+    restart: unless-stopped
+    depends_on: [prometheus, postgres]
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      POSTGRES_USER:     ${POSTGRES_USER:-churnuser}      # read by datasources.yml
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+
+  frontend:
+    build: {context: ./frontend, dockerfile: Dockerfile}
+    container_name: churn-frontend
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "3001:80"
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:

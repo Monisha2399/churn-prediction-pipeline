@@ -1,0 +1,18 @@
+FROM apache/airflow:2.9.2-python3.11
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+# Isolated ML environment: Airflow 2.9 needs SQLAlchemy<2, our code needs SQLAlchemy 2
+RUN python -m venv /opt/venv && chown -R airflow:root /opt/venv && chmod -R g+rwX /opt/venv
+COPY requirements.txt /tmp/requirements.txt
+USER airflow
+RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+      -r /tmp/requirements.txt
+USER root
+ENV NLTK_DATA=/opt/nltk_data HF_HOME=/opt/hf_cache
+# bake NLTK data + the small embedding model into the image (no downloads at run time)
+RUN /opt/venv/bin/python -c "import nltk; [nltk.download(p, download_dir='/opt/nltk_data', quiet=True) for p in ('punkt','punkt_tab','stopwords','wordnet','omw-1.4','vader_lexicon')]" \
+ && /opt/venv/bin/python -c "from sentence_transformers import SentenceTransformer as S; S('sentence-transformers/all-MiniLM-L6-v2')" \
+ && chmod -R a+rwX /opt/nltk_data /opt/hf_cache
+USER airflow

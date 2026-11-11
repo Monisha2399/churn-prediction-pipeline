@@ -1,0 +1,3 @@
+# Notebooks — exploration only
+# Do NOT commit secrets, full datasets, or trained models here.
+# Models and embeddings go to S3 / MLflow.
